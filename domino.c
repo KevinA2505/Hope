@@ -21,6 +21,22 @@ typedef enum
     SJF_POINTS,
     RR
 } policy_t;
+
+static const char *policy_name(policy_t p)
+{
+    switch (p)
+    {
+    case FCFS:
+        return "FCFS";
+    case SJF_PLAYERS:
+        return "SJF_PLAYERS";
+    case SJF_POINTS:
+        return "SJF_POINTS";
+    case RR:
+        return "RR";
+    }
+    return "?";
+}
 typedef enum
 {
     NEW,
@@ -80,7 +96,6 @@ typedef struct
 } control_args_t;
 
 static int parse_policy_name(const char *s, policy_t *out);
-static void set_policy_for(game_state_t *g, policy_t newp);
 void *control_thread(void *arg);
 
 /* ===== util ===== */
@@ -317,6 +332,132 @@ static void q_destroy(action_queue_t *q)
     pthread_mutex_destroy(&q->mtx);
     pthread_cond_destroy(&q->not_empty);
     free(q->buf);
+}
+
+/* ===== cola de cambios de política / quantum ===== */
+typedef struct
+{
+    int table_id;
+    int change_policy;
+    policy_t new_policy;
+    int change_quantum;
+    int new_quantum_ms;
+} policy_change_t;
+
+typedef struct
+{
+    policy_change_t *buf;
+    int head, tail, size, capacity;
+    int stop;
+    pthread_mutex_t mtx;
+    pthread_cond_t not_empty;
+} policy_queue_t;
+
+static policy_queue_t POLICY_Q;
+
+static void policy_q_init(policy_queue_t *q)
+{
+    memset(q, 0, sizeof(*q));
+    q->capacity = 32;
+    q->buf = malloc(sizeof(policy_change_t) * q->capacity);
+    if (!q->buf)
+    {
+        perror("malloc policy queue");
+        exit(1);
+    }
+    pthread_mutex_init(&q->mtx, NULL);
+    pthread_cond_init(&q->not_empty, NULL);
+}
+
+static void policy_q_grow(policy_queue_t *q)
+{
+    int new_cap = q->capacity * 2;
+    policy_change_t *nbuf = malloc(sizeof(policy_change_t) * new_cap);
+    if (!nbuf)
+    {
+        perror("malloc policy queue grow");
+        exit(1);
+    }
+    for (int i = 0; i < q->size; i++)
+        nbuf[i] = q->buf[(q->head + i) % q->capacity];
+    free(q->buf);
+    q->buf = nbuf;
+    q->capacity = new_cap;
+    q->head = 0;
+    q->tail = q->size;
+}
+
+static void policy_q_push(policy_queue_t *q, policy_change_t ch)
+{
+    pthread_mutex_lock(&q->mtx);
+    if (q->stop)
+    {
+        pthread_mutex_unlock(&q->mtx);
+        return;
+    }
+    if (q->size == q->capacity)
+        policy_q_grow(q);
+    q->buf[q->tail] = ch;
+    q->tail = (q->tail + 1) % q->capacity;
+    q->size++;
+    pthread_cond_signal(&q->not_empty);
+    pthread_mutex_unlock(&q->mtx);
+}
+
+static int policy_q_pop(policy_queue_t *q, policy_change_t *out)
+{
+    pthread_mutex_lock(&q->mtx);
+    while (q->size == 0 && !q->stop)
+        pthread_cond_wait(&q->not_empty, &q->mtx);
+    if (q->size == 0)
+    {
+        pthread_mutex_unlock(&q->mtx);
+        return 0;
+    }
+    *out = q->buf[q->head];
+    q->head = (q->head + 1) % q->capacity;
+    q->size--;
+    pthread_mutex_unlock(&q->mtx);
+    return 1;
+}
+
+static void policy_q_stop(policy_queue_t *q)
+{
+    pthread_mutex_lock(&q->mtx);
+    q->stop = 1;
+    pthread_cond_broadcast(&q->not_empty);
+    pthread_mutex_unlock(&q->mtx);
+}
+
+static void policy_q_destroy(policy_queue_t *q)
+{
+    pthread_mutex_destroy(&q->mtx);
+    pthread_cond_destroy(&q->not_empty);
+    free(q->buf);
+}
+
+static void request_policy_change(int table_id, policy_t newp)
+{
+    policy_change_t ch = {
+        .table_id = table_id,
+        .change_policy = 1,
+        .new_policy = newp,
+        .change_quantum = 0,
+        .new_quantum_ms = 0,
+    };
+    policy_q_push(&POLICY_Q, ch);
+}
+
+static void request_quantum_change(int table_id, int ms)
+{
+    policy_change_t ch = {
+        .table_id = table_id,
+        .change_policy = 0,
+        .new_policy = FCFS,
+        .change_quantum = 1,
+        .new_quantum_ms = ms,
+    };
+    policy_q_push(&POLICY_Q, ch);
 }
 
 /* ===== búsqueda de jugada posible ===== */
@@ -594,19 +735,6 @@ static int parse_policy_name(const char *s, policy_t *out)
     return 0;
 }
 
-static void set_policy_for(game_state_t *g, policy_t newp)
-{
-    pthread_mutex_lock(&g->mtx);
-    if (!g->finished)
-    {
-        g->policy = newp;
-        /* opcional: forzar salida de esperas largas */
-        g->action_done = 1;
-        pthread_cond_broadcast(&g->cv);
-    }
-    pthread_mutex_unlock(&g->mtx);
-}
-
 void *control_thread(void *arg)
 {
     control_args_t *ca = (control_args_t *)arg;
@@ -646,11 +774,8 @@ void *control_thread(void *arg)
             {
                 game_state_t *g = &ca->tables[i];
                 pthread_mutex_lock(&g->mtx);
-                const char *pn = (g->policy == FCFS ? "FCFS" : g->policy == SJF_POINTS ? "SJF_POINTS"
-                                                           : g->policy == SJF_PLAYERS  ? "SJF_PLAYERS"
-                                                                                       : "RR");
                 printf("Mesa %d: política=%s, quantum=%d ms, cooldown=%d ms, finished=%d\n",
-                       i, pn, g->rr_quantum_ms, g->turn_cooldown_ms, g->finished);
+                       i, policy_name(g->policy), g->rr_quantum_ms, g->turn_cooldown_ms, g->finished);
                 pthread_mutex_unlock(&g->mtx);
             }
             fflush(stdout);
@@ -669,8 +794,8 @@ void *control_thread(void *arg)
             if (strcmp(target, "all") == 0 || strcmp(target, "todas") == 0)
             {
                 for (int i = 0; i < ca->n_tables; i++)
-                    set_policy_for(&ca->tables[i], np);
-                printf(">> Política de TODAS las mesas cambiada a %s\n", param);
+                    request_policy_change(i, np);
+                printf(">> Solicitud: política de TODAS las mesas -> %s\n", param);
             }
             else
             {
@@ -681,8 +806,8 @@ void *control_thread(void *arg)
                     fflush(stderr);
                     continue;
                 }
-                set_policy_for(&ca->tables[id], np);
-                printf(">> Mesa %d: política cambiada a %s\n", id, param);
+                request_policy_change(id, np);
+                printf(">> Solicitud: Mesa %d -> política %s\n", id, param);
             }
             fflush(stdout);
             continue;
@@ -700,13 +825,8 @@ void *control_thread(void *arg)
             if (strcmp(target, "all") == 0 || strcmp(target, "todas") == 0)
             {
                 for (int i = 0; i < ca->n_tables; i++)
-                {
-                    pthread_mutex_lock(&ca->tables[i].mtx);
-                    ca->tables[i].rr_quantum_ms = ms;
-                    pthread_cond_broadcast(&ca->tables[i].cv);
-                    pthread_mutex_unlock(&ca->tables[i].mtx);
-                }
-                printf(">> Quantum de TODAS las mesas = %d ms\n", ms);
+                    request_quantum_change(i, ms);
+                printf(">> Solicitud: quantum de TODAS las mesas = %d ms\n", ms);
             }
             else
             {
@@ -717,11 +837,8 @@ void *control_thread(void *arg)
                     fflush(stderr);
                     continue;
                 }
-                pthread_mutex_lock(&ca->tables[id].mtx);
-                ca->tables[id].rr_quantum_ms = ms;
-                pthread_cond_broadcast(&ca->tables[id].cv);
-                pthread_mutex_unlock(&ca->tables[id].mtx);
-                printf(">> Mesa %d: quantum = %d ms\n", id, ms);
+                request_quantum_change(id, ms);
+                printf(">> Solicitud: Mesa %d -> quantum = %d ms\n", id, ms);
             }
             fflush(stdout);
             continue;
@@ -774,6 +891,52 @@ void *control_thread(void *arg)
                 "  show\n");
         fflush(stderr);
     }
+    return NULL;
+}
+
+typedef struct
+{
+    game_state_t *tables;
+    int n_tables;
+} policy_supervisor_args_t;
+
+void *policy_supervisor_thread(void *arg)
+{
+    policy_supervisor_args_t *psa = (policy_supervisor_args_t *)arg;
+
+    for (;;)
+    {
+        policy_change_t change;
+        if (!policy_q_pop(&POLICY_Q, &change))
+            break;
+
+        if (change.table_id < 0 || change.table_id >= psa->n_tables)
+            continue;
+
+        game_state_t *g = &psa->tables[change.table_id];
+        pthread_mutex_lock(&g->mtx);
+        if (!g->finished)
+        {
+            if (change.change_policy)
+            {
+                policy_t old = g->policy;
+                g->policy = change.new_policy;
+                printf(">> Supervisor: Mesa %d cambia política %s -> %s\n",
+                       g->table_id, policy_name(old), policy_name(change.new_policy));
+                fflush(stdout);
+            }
+            if (change.change_quantum)
+            {
+                g->rr_quantum_ms = change.new_quantum_ms;
+                printf(">> Supervisor: Mesa %d actualiza quantum = %d ms\n",
+                       g->table_id, change.new_quantum_ms);
+                fflush(stdout);
+            }
+            pthread_cond_broadcast(&g->cv);
+        }
+        pthread_mutex_unlock(&g->mtx);
+    }
+
     return NULL;
 }
 
@@ -902,9 +1065,7 @@ void *table_thread(void *arg)
 
     pthread_mutex_lock(&g->mtx);
     printf("\n=== Mesa %d: %d jugadores — Política: %s ===\n", g->table_id, g->nplayers,
-           (g->policy == FCFS ? "FCFS" : g->policy == SJF_POINTS ? "SJF_POINTS"
-                                     : g->policy == SJF_PLAYERS  ? "SJF_PLAYERS"
-                                                                 : "RR"));
+           policy_name(g->policy));
     printf("Apertura: Jugador %d juega ", opener);
     print_tile(first);
     printf("  -> extremos: %d y %d\n", g->left_end, g->right_end);
@@ -994,6 +1155,7 @@ int main(void)
 
     // Validador único global
     q_init(&GQ);
+    policy_q_init(&POLICY_Q);
     validator_args_t va = {.tables = tables, .n_tables = n_tables};
     pthread_t th_validator;
     if (pthread_create(&th_validator, NULL, validator_thread, &va) != 0)
@@ -1002,12 +1164,25 @@ int main(void)
         return 1;
     }
 
+    policy_supervisor_args_t psa = {.tables = tables, .n_tables = n_tables};
+    pthread_t th_policy_supervisor;
+    if (pthread_create(&th_policy_supervisor, NULL, policy_supervisor_thread, &psa) != 0)
+    {
+        perror("pthread_create(policy_supervisor)");
+        return 1;
+    }
+
     // Hilo de control en caliente (consola)
     control_args_t ca = {.tables = tables, .n_tables = n_tables};
     pthread_t th_control;
+    int control_thread_started = 0;
     if (pthread_create(&th_control, NULL, control_thread, &ca) != 0)
     {
         perror("pthread_create(control)"); /* no abortamos; solo avisamos */
+    }
+    else
+    {
+        control_thread_started = 1;
     }
 
     // Lanzar mesas con la política elegida
@@ -1025,9 +1200,14 @@ int main(void)
     for (int i = 0; i < n_tables; i++)
         pthread_join(th_tables[i], NULL);
     pthread_join(th_validator, NULL);
-    pthread_join(th_control, NULL);
+    if (control_thread_started)
+        pthread_join(th_control, NULL);
+
+    policy_q_stop(&POLICY_Q);
+    pthread_join(th_policy_supervisor, NULL);
 
     q_destroy(&GQ);
+    policy_q_destroy(&POLICY_Q);
     puts("\nTodas las mesas han terminado.");
     free(th_tables);
     free(tables);
