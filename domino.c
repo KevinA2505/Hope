@@ -404,21 +404,23 @@ static void policy_q_push(policy_queue_t *q, policy_change_t ch)
     pthread_mutex_unlock(&q->mtx);
 }
 
-static int policy_q_pop(policy_queue_t *q, policy_change_t *out)
+static int policy_q_try_pop(policy_queue_t *q, policy_change_t *out)
 {
+    int ret = 0;
     pthread_mutex_lock(&q->mtx);
-    while (q->size == 0 && !q->stop)
-        pthread_cond_wait(&q->not_empty, &q->mtx);
-    if (q->size == 0)
+    if (q->size > 0)
     {
-        pthread_mutex_unlock(&q->mtx);
-        return 0;
+        *out = q->buf[q->head];
+        q->head = (q->head + 1) % q->capacity;
+        q->size--;
+        ret = 1;
     }
-    *out = q->buf[q->head];
-    q->head = (q->head + 1) % q->capacity;
-    q->size--;
+    else if (q->stop)
+    {
+        ret = -1;
+    }
     pthread_mutex_unlock(&q->mtx);
-    return 1;
+    return ret;
 }
 
 static void policy_q_stop(policy_queue_t *q)
@@ -458,6 +460,91 @@ static void request_quantum_change(int table_id, int ms)
         .new_quantum_ms = ms,
     };
     policy_q_push(&POLICY_Q, ch);
+}
+
+static int evaluate_auto_policy(game_state_t *g, policy_t *next_out)
+{
+    if (g->nplayers <= 0)
+        return 0;
+
+    int min_tiles = INT_MAX, max_tiles = 0;
+    int min_points = INT_MAX, max_points = 0;
+
+    for (int p = 0; p < g->nplayers; ++p)
+    {
+        int tiles = g->hand_len[p];
+        if (tiles < min_tiles)
+            min_tiles = tiles;
+        if (tiles > max_tiles)
+            max_tiles = tiles;
+
+        int pts = hand_points(g, p);
+        if (pts < min_points)
+            min_points = pts;
+        if (pts > max_points)
+            max_points = pts;
+    }
+
+    int tile_gap = max_tiles - min_tiles;
+    int point_gap = max_points - min_points;
+
+    if (g->pass_streak >= g->nplayers && g->policy != RR)
+    {
+        *next_out = RR;
+        return 1;
+    }
+
+    if (tile_gap >= 3 && g->policy != SJF_PLAYERS)
+    {
+        *next_out = SJF_PLAYERS;
+        return 1;
+    }
+
+    if (point_gap >= 12 && g->policy != SJF_POINTS)
+    {
+        *next_out = SJF_POINTS;
+        return 1;
+    }
+
+    if (g->policy == SJF_POINTS && tile_gap >= 3)
+    {
+        *next_out = SJF_PLAYERS;
+        return 1;
+    }
+
+    if (g->policy == SJF_PLAYERS && point_gap >= 12)
+    {
+        *next_out = SJF_POINTS;
+        return 1;
+    }
+
+    if (g->policy != FCFS && tile_gap <= 1 && point_gap <= 6 && g->pass_streak == 0)
+    {
+        *next_out = FCFS;
+        return 1;
+    }
+
+    if (g->policy == RR && g->pass_streak == 0 && tile_gap >= 3)
+    {
+        *next_out = SJF_PLAYERS;
+        return 1;
+    }
+
+    return 0;
+}
+
+static int supervisor_apply_policy_change(game_state_t *g, policy_t new_policy, const char *reason)
+{
+    if (g->policy == new_policy)
+        return 0;
+
+    policy_t old = g->policy;
+    g->policy = new_policy;
+    printf(">> Supervisor%s: Mesa %d cambia política %s -> %s\n",
+           reason ? reason : "", g->table_id, policy_name(old), policy_name(new_policy));
+    fflush(stdout);
+    pthread_cond_broadcast(&g->cv);
+    return 1;
 }
 
 /* ===== búsqueda de jugada posible ===== */
@@ -904,37 +991,56 @@ void *policy_supervisor_thread(void *arg)
 {
     policy_supervisor_args_t *psa = (policy_supervisor_args_t *)arg;
 
+    int stop_requested = 0;
     for (;;)
     {
         policy_change_t change;
-        if (!policy_q_pop(&POLICY_Q, &change))
+        int popped = policy_q_try_pop(&POLICY_Q, &change);
+        if (popped == 1)
+        {
+            if (change.table_id < 0 || change.table_id >= psa->n_tables)
+                continue;
+
+            game_state_t *g = &psa->tables[change.table_id];
+            pthread_mutex_lock(&g->mtx);
+            if (!g->finished)
+            {
+                if (change.change_policy)
+                    supervisor_apply_policy_change(g, change.new_policy, " (solicitado)");
+                if (change.change_quantum)
+                {
+                    g->rr_quantum_ms = change.new_quantum_ms;
+                    printf(">> Supervisor (solicitado): Mesa %d actualiza quantum = %d ms\n",
+                           g->table_id, change.new_quantum_ms);
+                    fflush(stdout);
+                    pthread_cond_broadcast(&g->cv);
+                }
+            }
+            pthread_mutex_unlock(&g->mtx);
+            continue;
+        }
+        if (popped == -1)
+            stop_requested = 1;
+
+        int active_tables = 0;
+        for (int i = 0; i < psa->n_tables; ++i)
+        {
+            game_state_t *g = &psa->tables[i];
+            pthread_mutex_lock(&g->mtx);
+            if (!g->finished)
+            {
+                active_tables = 1;
+                policy_t next;
+                if (evaluate_auto_policy(g, &next))
+                    supervisor_apply_policy_change(g, next, " (auto)");
+            }
+            pthread_mutex_unlock(&g->mtx);
+        }
+
+        if (!active_tables && stop_requested)
             break;
 
-        if (change.table_id < 0 || change.table_id >= psa->n_tables)
-            continue;
-
-        game_state_t *g = &psa->tables[change.table_id];
-        pthread_mutex_lock(&g->mtx);
-        if (!g->finished)
-        {
-            if (change.change_policy)
-            {
-                policy_t old = g->policy;
-                g->policy = change.new_policy;
-                printf(">> Supervisor: Mesa %d cambia política %s -> %s\n",
-                       g->table_id, policy_name(old), policy_name(change.new_policy));
-                fflush(stdout);
-            }
-            if (change.change_quantum)
-            {
-                g->rr_quantum_ms = change.new_quantum_ms;
-                printf(">> Supervisor: Mesa %d actualiza quantum = %d ms\n",
-                       g->table_id, change.new_quantum_ms);
-                fflush(stdout);
-            }
-            pthread_cond_broadcast(&g->cv);
-        }
-        pthread_mutex_unlock(&g->mtx);
+        sleep_ms(50);
     }
 
     return NULL;
