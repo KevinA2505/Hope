@@ -1,4 +1,5 @@
 // domino.c — Planificador por mesa (FCFS / SJF_POINTS / SJF_PLAYERS / RR) + 1 acción por turno
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,11 +7,12 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <limits.h>
+#include <errno.h>
 
 #define MAX_PLAYERS 4
 #define MAX_TILES 28
 #define ACTION_Q_CAP 1024
-#define TURN_COOLDOWN_US 1000000 // 1 s al inicio de cada turno planificado
+#define DEFAULT_TURN_COOLDOWN_MS 0 // enfriamiento configurable por turno planificado
 
 typedef enum
 {
@@ -50,6 +52,7 @@ typedef struct
     // NUEVO: planificación y sincronización de turnos
     policy_t policy;
     int rr_quantum_ms; // reservado para permitir N acciones por quantum en el futuro
+    int turn_cooldown_ms;
     int action_done;   // lo setea el validador tras aplicar una acción
 
     pthread_mutex_t mtx;
@@ -85,6 +88,19 @@ static inline int is_double(tile_t t) { return t.a == t.b; }
 static inline int tile_sum(tile_t t) { return t.a + t.b; }
 static void print_tile(tile_t t) { printf("[%d|%d]", t.a, t.b); }
 
+static void sleep_ms(int ms)
+{
+    if (ms <= 0)
+        return;
+    struct timespec ts = {
+        .tv_sec = ms / 1000,
+        .tv_nsec = (long)(ms % 1000) * 1000000L,
+    };
+    struct timespec rem = {0};
+    while (nanosleep(&ts, &rem) == -1 && errno == EINTR)
+        ts = rem;
+}
+
 static int hand_points(game_state_t *g, int pid)
 {
     int s = 0;
@@ -98,7 +114,8 @@ static int winner_lowest_points(game_state_t *g)
     for (int p = 0; p < g->nplayers; p++)
     {
         int pts = hand_points(g, p), tiles = g->hand_len[p];
-        if (pts < best_pts || (pts == best_pts && tiles < best_tiles) || (pts == best_tiles && pts == best_pts && p < win))
+        if (pts < best_pts || (pts == best_pts && tiles < best_tiles) ||
+            (pts == best_pts && tiles == best_tiles && p < win))
         {
             win = p;
             best_pts = pts;
@@ -329,8 +346,9 @@ void *player_thread(void *arg)
         }
 
         // cooldown al inicio del turno planificado
+        int cooldown_ms = g->turn_cooldown_ms;
         pthread_mutex_unlock(&g->mtx);
-        usleep(TURN_COOLDOWN_US);
+        sleep_ms(cooldown_ms);
         pthread_mutex_lock(&g->mtx);
 
         if (g->finished)
@@ -444,7 +462,7 @@ void *validator_thread(void *arg)
         {
             if (all_tables_finished(tables, N))
                 return NULL;
-            usleep(1000);
+            sleep_ms(1);
         }
         if (act.table_id < 0 || act.table_id >= N)
             continue;
@@ -566,6 +584,7 @@ void *control_thread(void *arg)
             "\n[Controles] Comandos:\n"
             "  policy <mesa|all> <FCFS|SJF_POINTS|SJF_PLAYERS|RR>\n"
             "  quantum <mesa|all> <ms>\n"
+            "  cooldown <mesa|all> <ms>\n"
             "  show\n\n");
     fflush(stdout);
 
@@ -595,8 +614,8 @@ void *control_thread(void *arg)
                 const char *pn = (g->policy == FCFS ? "FCFS" : g->policy == SJF_POINTS ? "SJF_POINTS"
                                                            : g->policy == SJF_PLAYERS  ? "SJF_PLAYERS"
                                                                                        : "RR");
-                printf("Mesa %d: política=%s, quantum=%d ms, finished=%d\n",
-                       i, pn, g->rr_quantum_ms, g->finished);
+                printf("Mesa %d: política=%s, quantum=%d ms, cooldown=%d ms, finished=%d\n",
+                       i, pn, g->rr_quantum_ms, g->turn_cooldown_ms, g->finished);
                 pthread_mutex_unlock(&g->mtx);
             }
             fflush(stdout);
@@ -673,10 +692,50 @@ void *control_thread(void *arg)
             continue;
         }
 
+        if (n == 3 && strcmp(cmd, "cooldown") == 0)
+        {
+            int ms = atoi(param);
+            if (ms < 0)
+            {
+                fprintf(stderr, "Cooldown inválido: %s\n", param);
+                fflush(stderr);
+                continue;
+            }
+            if (strcmp(target, "all") == 0)
+            {
+                for (int i = 0; i < ca->n_tables; i++)
+                {
+                    pthread_mutex_lock(&ca->tables[i].mtx);
+                    ca->tables[i].turn_cooldown_ms = ms;
+                    pthread_cond_broadcast(&ca->tables[i].cv);
+                    pthread_mutex_unlock(&ca->tables[i].mtx);
+                }
+                printf(">> Cooldown de TODAS las mesas = %d ms\n", ms);
+            }
+            else
+            {
+                int id = atoi(target);
+                if (id < 0 || id >= ca->n_tables)
+                {
+                    fprintf(stderr, "Mesa inválida: %s\n", target);
+                    fflush(stderr);
+                    continue;
+                }
+                pthread_mutex_lock(&ca->tables[id].mtx);
+                ca->tables[id].turn_cooldown_ms = ms;
+                pthread_cond_broadcast(&ca->tables[id].cv);
+                pthread_mutex_unlock(&ca->tables[id].mtx);
+                printf(">> Mesa %d: cooldown = %d ms\n", id, ms);
+            }
+            fflush(stdout);
+            continue;
+        }
+
         fprintf(stderr,
                 "Comando no reconocido. Use:\n"
                 "  policy <mesa|all> <FCFS|SJF_POINTS|SJF_PLAYERS|RR>\n"
                 "  quantum <mesa|all> <ms>\n"
+                "  cooldown <mesa|all> <ms>\n"
                 "  show\n");
         fflush(stderr);
     }
@@ -791,6 +850,7 @@ static void init_table(game_state_t *g, int table_id, int nplayers, policy_t pol
     g->pass_streak = 0;
     g->policy = pol;
     g->rr_quantum_ms = 200; // reservado (futuro)
+    g->turn_cooldown_ms = DEFAULT_TURN_COOLDOWN_MS;
     g->action_done = 0;
     pthread_mutex_init(&g->mtx, NULL);
     pthread_cond_init(&g->cv, NULL);
@@ -874,6 +934,7 @@ void *validator_thread(void *); // fwd
 int main(void)
 {
     srand((unsigned)time(NULL));
+    setvbuf(stdout, NULL, _IONBF, 0);
     int n_tables = 0;
     char input_buf[32];
 
