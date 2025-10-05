@@ -6,6 +6,11 @@
 - Hay soporte para cuatro políticas de planificación (FCFS, RR, SJF_POINTS y SJF_PLAYERS) seleccionables en caliente mediante un hilo de control que también permite ajustar el quantum asociado al modo RR o consultar el estado de las mesas.
 - El flujo principal pide cuántas mesas crear, inicializa su estado con jugadores aleatorios, lanza todos los hilos auxiliares (validador y consola de control) y espera a que las mesas terminen para liberar recursos.
 
+### Condiciones de finalización
+- Una mesa termina inmediatamente cuando un jugador coloca su última ficha (`DOMINA`).
+- Si nadie puede jugar y tampoco hay fichas en el pozo, el validador registra pases consecutivos. Cuando la racha de pases (`pass_streak`) alcanza el número de jugadores en la mesa, se cierra la ronda por bloqueo y se declara vencedor al jugador con menor puntaje en la mano.
+- Mientras la racha de pases no llegue a todos los jugadores, la mesa continúa, aunque en el log se vea que algunos jugadores ya no tienen jugadas o el pozo esté vacío. Basta con que alguien coloque una ficha válida para reiniciar la racha y mantener la partida en curso.
+
 ## Cómo compilar
 Compila el ejecutable con GCC y la librería de hilos de POSIX:
 
