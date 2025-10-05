@@ -614,10 +614,13 @@ void *control_thread(void *arg)
 
     fprintf(stdout,
             "\n[Controles] Comandos:\n"
-            "  policy <mesa|all> <FCFS|SJF_POINTS|SJF_PLAYERS|RR>\n"
-            "  quantum <mesa|all> <ms>\n"
-            "  cooldown <mesa|all> <ms>\n"
-            "  show\n\n");
+            "  ver                     # muestra el estado de todas las mesas\n"
+            "  modo todas FCFS         # cambia la política de todas las mesas\n"
+            "  modo 2 RR               # cambia la política de la mesa 2\n"
+            "  vel todas 150           # ajusta el quantum (ms) de todas las mesas\n"
+            "  vel 1 200               # ajusta el quantum de la mesa 1\n"
+            "  pausa todas 0           # ajusta el cooldown (ms) de todas las mesas\n"
+            "  pausa 3 50              # ajusta el cooldown de la mesa 3\n\n");
     fflush(stdout);
 
     while (1)
@@ -637,7 +640,7 @@ void *control_thread(void *arg)
         char cmd[32] = {0}, target[32] = {0}, param[32] = {0};
         int n = sscanf(line, "%31s %31s %31s", cmd, target, param);
 
-        if (n >= 1 && strcmp(cmd, "show") == 0)
+        if (n >= 1 && (strcmp(cmd, "show") == 0 || strcmp(cmd, "ver") == 0 || strcmp(cmd, "v") == 0))
         {
             for (int i = 0; i < ca->n_tables; i++)
             {
@@ -654,7 +657,7 @@ void *control_thread(void *arg)
             continue;
         }
 
-        if (n == 3 && strcmp(cmd, "policy") == 0)
+        if (n == 3 && (strcmp(cmd, "policy") == 0 || strcmp(cmd, "modo") == 0 || strcmp(cmd, "m") == 0))
         {
             policy_t np;
             if (!parse_policy_name(param, &np))
@@ -663,7 +666,7 @@ void *control_thread(void *arg)
                 fflush(stderr);
                 continue;
             }
-            if (strcmp(target, "all") == 0)
+            if (strcmp(target, "all") == 0 || strcmp(target, "todas") == 0)
             {
                 for (int i = 0; i < ca->n_tables; i++)
                     set_policy_for(&ca->tables[i], np);
@@ -685,7 +688,7 @@ void *control_thread(void *arg)
             continue;
         }
 
-        if (n == 3 && (strcmp(cmd, "quantum") == 0 || strcmp(cmd, "q") == 0))
+        if (n == 3 && (strcmp(cmd, "quantum") == 0 || strcmp(cmd, "q") == 0 || strcmp(cmd, "vel") == 0))
         {
             int ms = atoi(param);
             if (ms <= 0)
@@ -694,7 +697,7 @@ void *control_thread(void *arg)
                 fflush(stderr);
                 continue;
             }
-            if (strcmp(target, "all") == 0)
+            if (strcmp(target, "all") == 0 || strcmp(target, "todas") == 0)
             {
                 for (int i = 0; i < ca->n_tables; i++)
                 {
@@ -724,7 +727,7 @@ void *control_thread(void *arg)
             continue;
         }
 
-        if (n == 3 && strcmp(cmd, "cooldown") == 0)
+        if (n == 3 && (strcmp(cmd, "cooldown") == 0 || strcmp(cmd, "pausa") == 0))
         {
             int ms = atoi(param);
             if (ms < 0)
@@ -733,7 +736,7 @@ void *control_thread(void *arg)
                 fflush(stderr);
                 continue;
             }
-            if (strcmp(target, "all") == 0)
+            if (strcmp(target, "all") == 0 || strcmp(target, "todas") == 0)
             {
                 for (int i = 0; i < ca->n_tables; i++)
                 {
