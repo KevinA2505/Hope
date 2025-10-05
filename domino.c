@@ -250,8 +250,8 @@ typedef struct
 
 typedef struct
 {
-    action_t buf[ACTION_Q_CAP];
-    int head, tail, size;
+    action_t *buf;
+    int head, tail, size, capacity;
     pthread_mutex_t mtx;
     pthread_cond_t not_empty;
 } action_queue_t;
@@ -260,21 +260,42 @@ static action_queue_t GQ;
 static void q_init(action_queue_t *q)
 {
     memset(q, 0, sizeof(*q));
+    q->capacity = ACTION_Q_CAP;
+    q->buf = malloc(sizeof(action_t) * q->capacity);
+    if (!q->buf)
+    {
+        perror("malloc action queue");
+        exit(1);
+    }
     pthread_mutex_init(&q->mtx, NULL);
     pthread_cond_init(&q->not_empty, NULL);
+}
+static void q_grow(action_queue_t *q)
+{
+    int new_cap = q->capacity * 2;
+    action_t *nbuf = malloc(sizeof(action_t) * new_cap);
+    if (!nbuf)
+    {
+        perror("malloc action queue grow");
+        exit(1);
+    }
+    for (int i = 0; i < q->size; i++)
+        nbuf[i] = q->buf[(q->head + i) % q->capacity];
+    free(q->buf);
+    q->buf = nbuf;
+    q->capacity = new_cap;
+    q->head = 0;
+    q->tail = q->size;
 }
 static void q_push(action_queue_t *q, action_t a)
 {
     pthread_mutex_lock(&q->mtx);
-    if (q->size == ACTION_Q_CAP)
-        fprintf(stderr, "WARN: action queue full, dropping\n");
-    else
-    {
-        q->buf[q->tail] = a;
-        q->tail = (q->tail + 1) % ACTION_Q_CAP;
-        q->size++;
-        pthread_cond_signal(&q->not_empty);
-    }
+    if (q->size == q->capacity)
+        q_grow(q);
+    q->buf[q->tail] = a;
+    q->tail = (q->tail + 1) % q->capacity;
+    q->size++;
+    pthread_cond_signal(&q->not_empty);
     pthread_mutex_unlock(&q->mtx);
 }
 static int q_pop(action_queue_t *q, action_t *out)
@@ -284,12 +305,18 @@ static int q_pop(action_queue_t *q, action_t *out)
     if (q->size > 0)
     {
         *out = q->buf[q->head];
-        q->head = (q->head + 1) % ACTION_Q_CAP;
+        q->head = (q->head + 1) % q->capacity;
         q->size--;
         ok = 1;
     }
     pthread_mutex_unlock(&q->mtx);
     return ok;
+}
+static void q_destroy(action_queue_t *q)
+{
+    pthread_mutex_destroy(&q->mtx);
+    pthread_cond_destroy(&q->not_empty);
+    free(q->buf);
 }
 
 /* ===== búsqueda de jugada posible ===== */
@@ -363,19 +390,24 @@ void *player_thread(void *arg)
         }
 
         // decidir 1 acción
+        action_t planned = {.table_id = g->table_id, .player_id = pid};
         int idx = -1, side = 0;
         if (find_play(g, pid, &idx, &side))
         {
-            q_push(&GQ, (action_t){.table_id = g->table_id, .player_id = pid, .kind = ACT_PLAY, .idx_in_hand = idx, .side = side});
+            planned.kind = ACT_PLAY;
+            planned.idx_in_hand = idx;
+            planned.side = side;
         }
         else if (g->pool_len > 0)
         {
-            q_push(&GQ, (action_t){.table_id = g->table_id, .player_id = pid, .kind = ACT_DRAW});
+            planned.kind = ACT_DRAW;
         }
         else
         {
-            q_push(&GQ, (action_t){.table_id = g->table_id, .player_id = pid, .kind = ACT_PASS});
+            planned.kind = ACT_PASS;
         }
+
+        q_push(&GQ, planned);
 
         // esperar a que el validador aplique (cerrando el "turno planificado")
         while (!g->finished && !g->action_done)
@@ -992,6 +1024,7 @@ int main(void)
     pthread_join(th_validator, NULL);
     pthread_join(th_control, NULL);
 
+    q_destroy(&GQ);
     puts("\nTodas las mesas han terminado.");
     free(th_tables);
     free(tables);
