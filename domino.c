@@ -95,7 +95,6 @@ typedef struct
     int n_tables;
 } control_args_t;
 
-static int parse_policy_name(const char *s, policy_t *out);
 void *control_thread(void *arg);
 
 /* ===== util ===== */
@@ -450,18 +449,6 @@ static void request_policy_change(int table_id, policy_t newp)
     policy_q_push(&POLICY_Q, ch);
 }
 
-static void request_quantum_change(int table_id, int ms)
-{
-    policy_change_t ch = {
-        .table_id = table_id,
-        .change_policy = 0,
-        .new_policy = FCFS,
-        .change_quantum = 1,
-        .new_quantum_ms = ms,
-    };
-    policy_q_push(&POLICY_Q, ch);
-}
-
 static int evaluate_auto_policy(game_state_t *g, policy_t *next_out)
 {
     if (g->nplayers <= 0)
@@ -797,187 +784,63 @@ void *validator_thread(void *arg)
 
 /* ===== control en caliente (consola) ===== */
 
-static int parse_policy_name(const char *s, policy_t *out)
-{
-    if (strcmp(s, "FCFS") == 0)
-    {
-        *out = FCFS;
-        return 1;
-    }
-    if (strcmp(s, "RR") == 0)
-    {
-        *out = RR;
-        return 1;
-    }
-    if (strcmp(s, "SJF_POINTS") == 0)
-    {
-        *out = SJF_POINTS;
-        return 1;
-    }
-    if (strcmp(s, "SJF_PLAYERS") == 0)
-    {
-        *out = SJF_PLAYERS;
-        return 1;
-    }
-    return 0;
-}
-
 void *control_thread(void *arg)
 {
     control_args_t *ca = (control_args_t *)arg;
-    char line[128];
 
-    fprintf(stdout,
-            "\n[Controles] Comandos:\n"
-            "  ver                     # muestra el estado de todas las mesas\n"
-            "  modo todas FCFS         # cambia la política de todas las mesas\n"
-            "  modo 2 RR               # cambia la política de la mesa 2\n"
-            "  vel todas 150           # ajusta el quantum (ms) de todas las mesas\n"
-            "  vel 1 200               # ajusta el quantum de la mesa 1\n"
-            "  pausa todas 0           # ajusta el cooldown (ms) de todas las mesas\n"
-            "  pausa 3 50              # ajusta el cooldown de la mesa 3\n\n");
-    fflush(stdout);
+    printf("\n[Supervisor automático] Iniciando monitoreo de mesas...\n");
 
-    while (1)
+    while (!all_tables_finished(ca->tables, ca->n_tables))
     {
-        if (all_tables_finished(ca->tables, ca->n_tables))
-            break;
-
-        if (!fgets(line, sizeof(line), stdin))
+        for (int i = 0; i < ca->n_tables; ++i)
         {
-            /* EOF de stdin: salir con gracia */
-            break;
-        }
-        line[strcspn(line, "\r\n")] = 0; // quitar newline
-        if (line[0] == '\0' || line[0] == '#')
-            continue;
+            game_state_t *g = &ca->tables[i];
+            policy_t desired_policy = FCFS;
+            int request_change = 0;
 
-        char cmd[32] = {0}, target[32] = {0}, param[32] = {0};
-        int n = sscanf(line, "%31s %31s %31s", cmd, target, param);
-
-        if (n >= 1 && (strcmp(cmd, "show") == 0 || strcmp(cmd, "ver") == 0 || strcmp(cmd, "v") == 0))
-        {
-            for (int i = 0; i < ca->n_tables; i++)
+            pthread_mutex_lock(&g->mtx);
+            if (!g->finished)
             {
-                game_state_t *g = &ca->tables[i];
-                pthread_mutex_lock(&g->mtx);
-                printf("Mesa %d: política=%s, quantum=%d ms, cooldown=%d ms, finished=%d\n",
-                       i, policy_name(g->policy), g->rr_quantum_ms, g->turn_cooldown_ms, g->finished);
-                pthread_mutex_unlock(&g->mtx);
-            }
-            fflush(stdout);
-            continue;
-        }
-
-        if (n == 3 && (strcmp(cmd, "policy") == 0 || strcmp(cmd, "modo") == 0 || strcmp(cmd, "m") == 0))
-        {
-            policy_t np;
-            if (!parse_policy_name(param, &np))
-            {
-                fprintf(stderr, "Política inválida: %s\n", param);
-                fflush(stderr);
-                continue;
-            }
-            if (strcmp(target, "all") == 0 || strcmp(target, "todas") == 0)
-            {
-                for (int i = 0; i < ca->n_tables; i++)
-                    request_policy_change(i, np);
-                printf(">> Solicitud: política de TODAS las mesas -> %s\n", param);
-            }
-            else
-            {
-                int id = atoi(target);
-                if (id < 0 || id >= ca->n_tables)
+                if (evaluate_auto_policy(g, &desired_policy) && desired_policy != g->policy)
                 {
-                    fprintf(stderr, "Mesa inválida: %s\n", target);
-                    fflush(stderr);
-                    continue;
+                    request_change = 1;
                 }
-                request_policy_change(id, np);
-                printf(">> Solicitud: Mesa %d -> política %s\n", id, param);
+                else if (g->policy == FCFS)
+                {
+                    desired_policy = (g->nplayers >= 3) ? SJF_PLAYERS : SJF_POINTS;
+                    request_change = 1;
+                }
             }
-            fflush(stdout);
-            continue;
+            pthread_mutex_unlock(&g->mtx);
+
+            if (request_change)
+                request_policy_change(i, desired_policy);
+
+            pthread_mutex_lock(&g->mtx);
+            if (!g->finished)
+            {
+                int desired_cooldown = (g->pass_streak >= g->nplayers) ? 75 : 0;
+                if (g->turn_cooldown_ms != desired_cooldown)
+                {
+                    g->turn_cooldown_ms = desired_cooldown;
+                    printf(">> Supervisor auto: Mesa %d ajusta cooldown = %d ms\n", i, desired_cooldown);
+                    pthread_cond_broadcast(&g->cv);
+                }
+
+                int desired_quantum = (g->policy == RR) ? 120 : 200;
+                if (g->rr_quantum_ms != desired_quantum)
+                {
+                    g->rr_quantum_ms = desired_quantum;
+                    printf(">> Supervisor auto: Mesa %d ajusta quantum = %d ms\n", i, desired_quantum);
+                }
+            }
+            pthread_mutex_unlock(&g->mtx);
         }
 
-        if (n == 3 && (strcmp(cmd, "quantum") == 0 || strcmp(cmd, "q") == 0 || strcmp(cmd, "vel") == 0))
-        {
-            int ms = atoi(param);
-            if (ms <= 0)
-            {
-                fprintf(stderr, "Quantum inválido: %s\n", param);
-                fflush(stderr);
-                continue;
-            }
-            if (strcmp(target, "all") == 0 || strcmp(target, "todas") == 0)
-            {
-                for (int i = 0; i < ca->n_tables; i++)
-                    request_quantum_change(i, ms);
-                printf(">> Solicitud: quantum de TODAS las mesas = %d ms\n", ms);
-            }
-            else
-            {
-                int id = atoi(target);
-                if (id < 0 || id >= ca->n_tables)
-                {
-                    fprintf(stderr, "Mesa inválida: %s\n", target);
-                    fflush(stderr);
-                    continue;
-                }
-                request_quantum_change(id, ms);
-                printf(">> Solicitud: Mesa %d -> quantum = %d ms\n", id, ms);
-            }
-            fflush(stdout);
-            continue;
-        }
-
-        if (n == 3 && (strcmp(cmd, "cooldown") == 0 || strcmp(cmd, "pausa") == 0))
-        {
-            int ms = atoi(param);
-            if (ms < 0)
-            {
-                fprintf(stderr, "Cooldown inválido: %s\n", param);
-                fflush(stderr);
-                continue;
-            }
-            if (strcmp(target, "all") == 0 || strcmp(target, "todas") == 0)
-            {
-                for (int i = 0; i < ca->n_tables; i++)
-                {
-                    pthread_mutex_lock(&ca->tables[i].mtx);
-                    ca->tables[i].turn_cooldown_ms = ms;
-                    pthread_cond_broadcast(&ca->tables[i].cv);
-                    pthread_mutex_unlock(&ca->tables[i].mtx);
-                }
-                printf(">> Cooldown de TODAS las mesas = %d ms\n", ms);
-            }
-            else
-            {
-                int id = atoi(target);
-                if (id < 0 || id >= ca->n_tables)
-                {
-                    fprintf(stderr, "Mesa inválida: %s\n", target);
-                    fflush(stderr);
-                    continue;
-                }
-                pthread_mutex_lock(&ca->tables[id].mtx);
-                ca->tables[id].turn_cooldown_ms = ms;
-                pthread_cond_broadcast(&ca->tables[id].cv);
-                pthread_mutex_unlock(&ca->tables[id].mtx);
-                printf(">> Mesa %d: cooldown = %d ms\n", id, ms);
-            }
-            fflush(stdout);
-            continue;
-        }
-
-        fprintf(stderr,
-                "Comando no reconocido. Use:\n"
-                "  policy <mesa|all> <FCFS|SJF_POINTS|SJF_PLAYERS|RR>\n"
-                "  quantum <mesa|all> <ms>\n"
-                "  cooldown <mesa|all> <ms>\n"
-                "  show\n");
-        fflush(stderr);
+        sleep_ms(100);
     }
+
+    printf("[Supervisor automático] Finalizó el monitoreo: todas las mesas terminaron.\n");
     return NULL;
 }
 
@@ -1007,37 +870,13 @@ void *policy_supervisor_thread(void *arg)
             {
                 if (change.change_policy)
                     supervisor_apply_policy_change(g, change.new_policy, " (solicitado)");
-                if (change.change_quantum)
-                {
-                    g->rr_quantum_ms = change.new_quantum_ms;
-                    printf(">> Supervisor (solicitado): Mesa %d actualiza quantum = %d ms\n",
-                           g->table_id, change.new_quantum_ms);
-                    fflush(stdout);
-                    pthread_cond_broadcast(&g->cv);
-                }
             }
             pthread_mutex_unlock(&g->mtx);
             continue;
         }
         if (popped == -1)
             stop_requested = 1;
-
-        int active_tables = 0;
-        for (int i = 0; i < psa->n_tables; ++i)
-        {
-            game_state_t *g = &psa->tables[i];
-            pthread_mutex_lock(&g->mtx);
-            if (!g->finished)
-            {
-                active_tables = 1;
-                policy_t next;
-                if (evaluate_auto_policy(g, &next))
-                    supervisor_apply_policy_change(g, next, " (auto)");
-            }
-            pthread_mutex_unlock(&g->mtx);
-        }
-
-        if (!active_tables && stop_requested)
+        if (stop_requested && all_tables_finished(psa->tables, psa->n_tables))
             break;
 
         sleep_ms(50);
@@ -1249,7 +1088,7 @@ int main(void)
     }
 
     // Puedes cambiar la política por defecto aquí:
-    policy_t default_policy = FCFS; // FCFS | SJF_POINTS | SJF_PLAYERS | RR
+    policy_t default_policy = SJF_POINTS; // FCFS | SJF_POINTS | SJF_PLAYERS | RR
 
     game_state_t *tables = calloc(n_tables, sizeof(game_state_t));
     pthread_t *th_tables = calloc(n_tables, sizeof(pthread_t));
